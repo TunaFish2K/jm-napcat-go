@@ -7,7 +7,7 @@ Single-binary Go rewrite of the JMComic NapCat bot.
 Build and run from the directory in which the bot should keep its cache:
 
 ```sh
-go build -trimpath -ldflags='-s -w' -o jm-napcat-go .
+go build -trimpath -ldflags='-s -w' -o jm-napcat-go ./src
 ./jm-napcat-go
 ```
 
