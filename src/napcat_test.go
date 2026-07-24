@@ -112,3 +112,139 @@ func TestNapcatForwardTransportMapsActions(t *testing.T) {
 		t.Fatal("client did not stop")
 	}
 }
+
+func TestNapcatMessageHandlerCanReplyOnSameConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	actions := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			var action map[string]any
+			if err := connection.ReadJSON(&action); err != nil {
+				return
+			}
+			name, _ := action["action"].(string)
+			actions <- name
+			response := map[string]any{"status": "ok", "retcode": 0, "echo": action["echo"]}
+			if name == "get_login_info" {
+				response["data"] = map[string]any{"user_id": 123, "nickname": "bot"}
+			}
+			if err := connection.WriteJSON(response); err != nil {
+				return
+			}
+			if name == "get_login_info" {
+				event := map[string]any{
+					"post_type":    "message",
+					"message_type": "group",
+					"self_id":      123,
+					"user_id":      456,
+					"group_id":     789,
+					"message":      []MessageSegment{TextSegment("/help")},
+				}
+				if err := connection.WriteJSON(event); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	cfg.NapcatWSURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewNapcatClient(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replied := make(chan error, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(message MessageContext) {
+			replied <- client.Send(context.Background(), message, []MessageSegment{TextSegment("reply")})
+		}, nil, nil)
+	}()
+
+	select {
+	case err := <-replied:
+		if err != nil {
+			t.Fatalf("message handler reply failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message handler could not receive action response")
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run() = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not stop")
+	}
+}
+
+func TestNapcatActionTimesOutWithoutResponse(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			var action map[string]any
+			if err := connection.ReadJSON(&action); err != nil {
+				return
+			}
+			if action["action"] != "get_login_info" {
+				continue
+			}
+			if err := connection.WriteJSON(map[string]any{
+				"status":  "ok",
+				"retcode": 0,
+				"echo":    action["echo"],
+				"data":    map[string]any{"user_id": 123, "nickname": "bot"},
+			}); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	cfg.NapcatWSURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewNapcatClient(cfg)
+	client.actionTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	login := make(chan LoginInfo, 1)
+	runErr := make(chan error, 1)
+	go func() { runErr <- client.Run(ctx, nil, nil, func(info LoginInfo) { login <- info }) }()
+	select {
+	case <-login:
+	case <-time.After(time.Second):
+		t.Fatal("login response timed out")
+	}
+
+	started := time.Now()
+	err := client.Send(context.Background(), MessageContext{MessageType: "group", GroupID: 456}, []MessageSegment{TextSegment("hello")})
+	if err == nil {
+		t.Fatal("Send() succeeded without an action response")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Send() took too long to time out: %s", elapsed)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run() = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not stop")
+	}
+}

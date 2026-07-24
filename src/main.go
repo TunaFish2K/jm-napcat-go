@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,21 +11,21 @@ import (
 func main() {
 	cfg, generated, err := LoadConfig(configFilename)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Startup failed: %v\n", err)
+		appLog.Error("startup failed while loading config", "error", err)
 		os.Exit(1)
 	}
 	if generated {
-		fmt.Printf("Created %s. Edit it and run the program again.\n", configFilename)
+		appLog.Info("configuration created; edit it and restart", "file", configFilename)
 		return
 	}
 
 	service, err := NewService(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Startup failed: %v\n", err)
+		appLog.Error("startup failed while creating service", "error", err)
 		os.Exit(1)
 	}
 	if err := service.Init(); err != nil {
-		fmt.Fprintf(os.Stderr, "Startup failed: %v\n", err)
+		appLog.Error("startup failed while initializing service", "error", err)
 		os.Exit(1)
 	}
 
@@ -43,10 +42,12 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("Shutting down gracefully...")
+		appLog.Info("shutdown signal received")
 	case err := <-runErr:
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Bot failed: %v\n", err)
+			appLog.Error("bot stopped with error", "error", err)
+		} else {
+			appLog.Info("bot stopped")
 		}
 		stop()
 	}
@@ -54,6 +55,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := service.Shutdown(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "Shutdown failed: %v\n", err)
+		appLog.Error("shutdown failed", "error", err)
 	}
 }

@@ -8,7 +8,9 @@ import (
 	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
@@ -81,6 +83,50 @@ func TestGeneratePDFDownloadsAndEmbedsImagesInInputOrder(t *testing.T) {
 	secondPage := bytes.Index(pdf, []byte("/MediaBox [0 0 10 11]"))
 	if firstPage < 0 || secondPage < 0 || firstPage > secondPage {
 		t.Fatal("PDF pages are not in input order")
+	}
+}
+
+func TestGeneratePDFRespectsNetworkConcurrency(t *testing.T) {
+	imageData := jpegImage(t, 8, 9, color.RGBA{R: 255, A: 255})
+	var active int32
+	var maxActive int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			previous := atomic.LoadInt32(&maxActive)
+			if current <= previous || atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+				break
+			}
+		}
+		defer atomic.AddInt32(&active, -1)
+		time.Sleep(40 * time.Millisecond)
+		writer.Header().Set("Content-Type", "image/jpeg")
+		_, _ = writer.Write(imageData)
+	}))
+	defer server.Close()
+
+	images := make([]ImageInfo, 6)
+	for index := range images {
+		images[index] = ImageInfo{Name: "page.jpg", URL: server.URL + "/" + string(rune('a'+index))}
+	}
+	processor := NewImageProcessor(DefaultConfig())
+	processor.client = server.Client()
+	if _, err := processor.GeneratePDF(
+		context.Background(),
+		PhotoInfo{ID: "123", Images: images},
+		1,
+		2,
+		2,
+		nil,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&maxActive); got > 2 {
+		t.Fatalf("max concurrent downloads = %d, want <= 2", got)
+	}
+	if got := atomic.LoadInt32(&maxActive); got < 2 {
+		t.Fatalf("max concurrent downloads = %d, want the pool to use concurrency", got)
 	}
 }
 

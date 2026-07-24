@@ -185,19 +185,22 @@ func (b *Bot) SetLoginInfo(info LoginInfo) {
 	b.selfID = info.UserID
 	b.nickname = info.Nickname
 	b.mu.Unlock()
-	fmt.Printf("Bot logged in: %s (%d)\n", info.Nickname, info.UserID)
+	appLog.Info("bot logged in", "user_id", info.UserID, "nickname", info.Nickname)
 }
 
 func (b *Bot) HandleFriendRequest(userID int64, comment string) {
-	fmt.Printf("Friend request from %d: %s\n", userID, comment)
+	appLog.Info("friend request handled", "user_id", userID, "comment", shortText(comment, 160))
 }
 
 func (b *Bot) HandleMessage(message MessageContext) {
 	text, ok := ExtractCommandText(message)
 	if !ok {
+		appLog.Debug("message ignored", "message_type", message.MessageType, "user_id", message.UserID, "group_id", message.GroupID, "text", shortText(extractText(message.Segments), 160))
 		return
 	}
+	appLog.Info("command received", "message_type", message.MessageType, "user_id", message.UserID, "group_id", message.GroupID, "text", shortText(text, 160))
 	if !b.limit.Try(message.UserID) {
+		appLog.Warn("command rate limited", "user_id", message.UserID, "text", shortText(text, 160))
 		_ = b.reply(context.Background(), message, BuildNotificationMessage("操作过于频繁，请稍后再试", message.UserID))
 		return
 	}
@@ -207,9 +210,11 @@ func (b *Bot) HandleMessage(message MessageContext) {
 	}
 	command, ok := ParseCommand(text)
 	if !ok {
+		appLog.Warn("command could not be parsed", "text", shortText(text, 160))
 		_ = b.reply(context.Background(), message, BuildNotificationMessage("\n"+BuildHelpMessage(), message.UserID))
 		return
 	}
+	appLog.Info("command parsed", "type", command.Type, "id", command.ID, "user_id", message.UserID, "group_id", message.GroupID)
 	if command.Type == "query" {
 		b.handleQuery(message, command.ID)
 	} else {
@@ -218,26 +223,35 @@ func (b *Bot) HandleMessage(message MessageContext) {
 }
 
 func (b *Bot) handleQuery(message MessageContext, id string) {
+	started := time.Now()
+	appLog.Info("query started", "id", id, "user_id", message.UserID, "group_id", message.GroupID)
 	if blockedID(id) {
+		appLog.Warn("query blocked by rule", "id", id, "user_id", message.UserID)
 		_ = b.reply(context.Background(), message, blockedReply(message.UserID))
 		return
 	}
-	if !b.service.IsInfoCached(id) {
+	cached := b.service.IsInfoCached(id)
+	appLog.Debug("query cache checked", "id", id, "hit", cached)
+	if !cached {
 		_ = b.reply(context.Background(), message, BuildNotificationMessage("查询中，请稍候...", message.UserID))
 	}
 	info, err := b.service.QueryInfo(context.Background(), id)
 	if err != nil {
+		appLog.Error("query failed", "id", id, "elapsed", time.Since(started), "error", err)
 		_ = b.reply(context.Background(), message, BuildNotificationMessage("查询失败："+extractErrorMessage(err), message.UserID))
 		return
 	}
+	appLog.Info("query data ready", "id", id, "elapsed", time.Since(started), "cover", info.Cover != nil)
 	text := buildInfoText(info) + "\n\n阅读：https://j.2kb.fish/reader/" + id
 	if b.trySendInfoForward(message, text, info.Cover) {
 		if message.MessageType != "private" {
 			_ = b.reply(context.Background(), message, []MessageSegment{AtSegment(message.UserID)})
 		}
+		appLog.Info("query completed", "id", id, "elapsed", time.Since(started), "delivery", "forward")
 		return
 	}
 	_ = b.reply(context.Background(), message, BuildNotificationMessage(text, message.UserID))
+	appLog.Info("query completed", "id", id, "elapsed", time.Since(started), "delivery", "plain")
 }
 
 func (b *Bot) trySendInfoForward(message MessageContext, text string, cover *string) bool {
@@ -249,50 +263,66 @@ func (b *Bot) trySendInfoForward(message MessageContext, text string, cover *str
 	if cover != nil {
 		nodes = append(nodes, ForwardNode{Content: []MessageSegment{ImageSegment(*cover)}, UserID: strconv.FormatInt(selfID, 10), Nickname: nickname, Summary: "[封面]"})
 	}
+	appLog.Info("sending info forward", "message_type", message.MessageType, "user_id", message.UserID, "group_id", message.GroupID, "nodes", len(nodes))
 	if err := b.api.SendForward(context.Background(), message, nodes); err == nil {
 		return true
 	} else {
-		fmt.Printf("sendForward (with cover) failed, trying text-only: %s\n", extractErrorMessage(err))
+		appLog.Warn("info forward failed; trying text-only", "error", err)
 	}
 	if err := b.api.SendForward(context.Background(), message, []ForwardNode{textNode}); err != nil {
-		fmt.Printf("sendForward (text-only) failed, falling back to plain message: %s\n", extractErrorMessage(err))
+		appLog.Warn("text-only forward failed; falling back to plain message", "error", err)
 		return false
 	}
 	return true
 }
 
 func (b *Bot) handleDownload(message MessageContext, id string) {
+	started := time.Now()
+	appLog.Info("PDF request started", "id", id, "user_id", message.UserID, "group_id", message.GroupID)
 	if blockedID(id) {
+		appLog.Warn("PDF request blocked by rule", "id", id, "user_id", message.UserID)
 		_ = b.reply(context.Background(), message, blockedReply(message.UserID))
 		return
 	}
 	_ = b.reply(context.Background(), message, BuildNotificationMessage("下载中", message.UserID))
 	enqueued := b.service.EnqueuePDF(id)
+	appLog.Info("PDF task enqueue result", "id", id, "status", enqueued.Status, "error", enqueued.Error)
 	if enqueued.Status == "error" {
 		_ = b.reply(context.Background(), message, BuildNotificationMessage("操作失败："+enqueued.Error, message.UserID))
 		return
 	}
 	sentEstimate := false
+	lastStatus := ""
 	for attempt := 0; attempt < b.cfg.MaxPollAttempts; attempt++ {
 		time.Sleep(time.Duration(b.cfg.PollIntervalMS) * time.Millisecond)
 		status := b.service.PDFStatus(id)
+		if status.Status != lastStatus {
+			appLog.Info("PDF task status changed", "id", id, "status", status.Status, "attempt", attempt+1)
+			lastStatus = status.Status
+		}
 		if status.Status == "ready" {
+			appLog.Info("PDF ready; encrypting", "id", id, "elapsed", time.Since(started))
 			data, err := b.service.ReadPDF(id)
 			if err != nil {
 				_ = b.reply(context.Background(), message, BuildNotificationMessage("PDF 生成失败："+extractErrorMessage(err), message.UserID))
 				return
 			}
+			encryptionStarted := time.Now()
 			encrypted, err := EncryptPDF(data, id)
 			if err != nil {
+				appLog.Error("PDF encryption failed", "id", id, "elapsed", time.Since(encryptionStarted), "error", err)
 				_ = b.reply(context.Background(), message, BuildNotificationMessage("PDF 生成失败："+extractErrorMessage(err), message.UserID))
 				return
 			}
+			appLog.Info("PDF encrypted", "id", id, "input_bytes", len(data), "output_bytes", len(encrypted), "elapsed", time.Since(encryptionStarted))
 			if !b.trySendPDFForward(message, encrypted, id) {
 				_ = b.reply(context.Background(), message, BuildFileNotification(encrypted, id+".pdf", message.UserID))
 			}
+			appLog.Info("PDF request completed", "id", id, "elapsed", time.Since(started))
 			return
 		}
 		if status.Status == "error" {
+			appLog.Error("PDF task failed", "id", id, "elapsed", time.Since(started), "error", status.Error)
 			_ = b.reply(context.Background(), message, BuildNotificationMessage("PDF 生成失败："+status.Error, message.UserID))
 			return
 		}
@@ -301,6 +331,7 @@ func (b *Bot) handleDownload(message MessageContext, id string) {
 			sentEstimate = true
 		}
 	}
+	appLog.Warn("PDF request timed out", "id", id, "elapsed", time.Since(started), "max_attempts", b.cfg.MaxPollAttempts)
 	_ = b.reply(context.Background(), message, BuildNotificationMessage("PDF 生成超时，请稍后重试", message.UserID))
 }
 
@@ -313,7 +344,7 @@ func (b *Bot) trySendPDFForward(message MessageContext, data []byte, id string) 
 		{Content: []MessageSegment{FileSegment(data, id+".pdf")}, UserID: strconv.FormatInt(selfID, 10), Nickname: nickname},
 	}
 	if err := b.api.SendForward(context.Background(), message, nodes); err != nil {
-		fmt.Printf("sendForward (pdf) failed, falling back to direct file send: %s\n", extractErrorMessage(err))
+		appLog.Warn("PDF forward failed; falling back to direct file", "id", id, "error", err)
 		return false
 	}
 	return true
@@ -329,7 +360,11 @@ func (b *Bot) reply(ctx context.Context, target MessageContext, message []Messag
 		}
 		message = filtered
 	}
-	return b.api.Send(ctx, target, message)
+	err := b.api.Send(ctx, target, message)
+	if err != nil {
+		appLog.Warn("reply failed", "message_type", target.MessageType, "user_id", target.UserID, "group_id", target.GroupID, "segments", len(message), "error", err)
+	}
+	return err
 }
 
 func BuildNotificationMessage(text string, userID int64) []MessageSegment {

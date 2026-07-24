@@ -215,8 +215,8 @@ func (s *Service) Init() error {
 		return fmt.Errorf("initialize PDF cache: %w", err)
 	}
 	total, maxSize, count := s.pdfCache.Stats()
-	fmt.Printf("Info cache initialized at %s\n", s.cfg.InfoCacheDir)
-	fmt.Printf("PDF cache initialized: %d records, %.1fMB / %.1fGB\n", count, float64(total)/1024/1024, float64(maxSize)/1024/1024/1024)
+	appLog.Info("info cache initialized", "directory", s.cfg.InfoCacheDir)
+	appLog.Info("PDF cache initialized", "records", count, "size_bytes", total, "max_bytes", maxSize)
 	return nil
 }
 
@@ -226,7 +226,7 @@ func (s *Service) StartWorkers(parent context.Context) {
 		s.workers.Add(1)
 		go s.runWorker(index + 1)
 	}
-	fmt.Printf("Started %d PDF workers\n", s.cfg.WorkerPoolSize)
+	appLog.Info("PDF workers started", "workers", s.cfg.WorkerPoolSize, "network_concurrency", s.cfg.NetworkConcurrency, "cpu_concurrency", s.cfg.CPUConcurrency)
 }
 
 func (s *Service) Shutdown(ctx context.Context) error {
@@ -239,6 +239,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.queue.close()
 	}
 	s.mu.Unlock()
+	appLog.Info("service shutdown started")
 	done := make(chan struct{})
 	go func() {
 		s.workers.Wait()
@@ -246,8 +247,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		appLog.Info("service shutdown completed")
 		return nil
 	case <-ctx.Done():
+		appLog.Warn("service shutdown timed out", "error", ctx.Err())
 		return ctx.Err()
 	}
 }
@@ -255,10 +258,15 @@ func (s *Service) Shutdown(ctx context.Context) error {
 func (s *Service) IsInfoCached(id string) bool { return s.infoCache.Has(id) }
 
 func (s *Service) QueryInfo(ctx context.Context, id string) (InfoResponse, error) {
+	started := time.Now()
 	var cached InfoResponse
 	if found, err := s.infoCache.Get(id, &cached); err == nil && found {
+		appLog.Info("info cache hit", "id", id, "elapsed", time.Since(started))
 		return cached, nil
+	} else if err != nil {
+		appLog.Warn("info cache read failed; querying upstream", "id", id, "error", err)
 	}
+	appLog.Info("info upstream query started", "id", id)
 	var photo PhotoInfo
 	var album AlbumInfo
 	var photoErr, albumErr error
@@ -273,12 +281,18 @@ func (s *Service) QueryInfo(ctx context.Context, id string) (InfoResponse, error
 		album, albumErr = s.upstream.QueryAlbum(ctx, id)
 	}()
 	queries.Wait()
+	appLog.Info("info upstream query completed", "id", id, "elapsed", time.Since(started), "photo_error", photoErr, "album_error", albumErr)
 	if photoErr != nil {
+		appLog.Error("photo query failed", "id", id, "error", photoErr)
 		return InfoResponse{}, translateError(photoErr)
 	}
+	coverStarted := time.Now()
 	cover, coverErr := s.images.DownloadCover(ctx, photo)
 	if coverErr != nil {
+		appLog.Warn("cover download or processing failed", "id", id, "elapsed", time.Since(coverStarted), "error", coverErr)
 		cover = nil
+	} else {
+		appLog.Info("cover processed", "id", id, "bytes", len(cover), "elapsed", time.Since(coverStarted))
 	}
 	response := InfoResponse{Name: photo.Name}
 	if albumErr == nil {
@@ -295,8 +309,9 @@ func (s *Service) QueryInfo(ctx context.Context, id string) (InfoResponse, error
 		response.Cover = &encoded
 	}
 	if err := s.infoCache.Set(id, response); err != nil {
-		fmt.Printf("Failed to cache info %s: %v\n", id, err)
+		appLog.Warn("info cache write failed", "id", id, "error", err)
 	}
+	appLog.Info("info query completed", "id", id, "elapsed", time.Since(started), "cover", response.Cover != nil)
 	return response, nil
 }
 
@@ -312,9 +327,11 @@ func (s *Service) EnqueuePDF(id string) TaskStatusResult {
 		return status
 	}
 	if !s.queue.push(id) {
+		appLog.Warn("PDF queue full", "id", id, "queue_limit", s.cfg.MaxTaskQueued)
 		return TaskStatusResult{Status: "error", Error: "Queue full"}
 	}
 	s.states.set(id, taskState{status: "pending", updatedAt: time.Now()})
+	appLog.Info("PDF task queued", "id", id)
 	return TaskStatusResult{Status: "pending"}
 }
 
@@ -361,34 +378,45 @@ func (s *Service) runWorker(workerID int) {
 			continue
 		}
 		state, _ := s.states.get(id)
+		workerStarted := time.Now()
+		appLog.Info("PDF worker started task", "worker", workerID, "id", id, "retry", state.retryCount)
 		s.states.set(id, taskState{status: "processing", retryCount: state.retryCount, updatedAt: time.Now()})
 		if err := s.generateTask(s.workerCtx, id, state.retryCount); err != nil {
 			if errors.Is(err, context.Canceled) || s.workerCtx.Err() != nil {
+				appLog.Warn("PDF worker canceled task", "worker", workerID, "id", id, "elapsed", time.Since(workerStarted), "error", err)
 				return
 			}
 			message := translateError(err)
-			fmt.Printf("Failed to generate PDF for %s (worker %d): %v\n", id, workerID, err)
+			appLog.Error("PDF worker failed task", "worker", workerID, "id", id, "retry", state.retryCount, "elapsed", time.Since(workerStarted), "error", err)
 			if state.retryCount < s.cfg.MaxRetries && s.queue.push(id) {
 				s.states.set(id, taskState{status: "pending", retryCount: state.retryCount + 1, updatedAt: time.Now()})
+				appLog.Warn("PDF task requeued", "id", id, "retry", state.retryCount+1)
 			} else if state.retryCount < s.cfg.MaxRetries {
 				s.states.set(id, taskState{status: "error", error: "Queue full on retry", retryCount: state.retryCount, updatedAt: time.Now()})
+				appLog.Error("PDF task retry rejected because queue is full", "id", id)
 			} else {
 				s.states.set(id, taskState{status: "error", error: extractErrorMessage(message), retryCount: state.retryCount, updatedAt: time.Now()})
+				appLog.Error("PDF task exhausted retries", "id", id, "error", message)
 			}
 			continue
 		}
 		s.states.delete(id)
-		fmt.Printf("PDF generated and cached: %s\n", id)
+		appLog.Info("PDF generated and cached", "worker", workerID, "id", id, "elapsed", time.Since(workerStarted))
 	}
 }
 
 func (s *Service) generateTask(ctx context.Context, id string, retryCount int) error {
+	started := time.Now()
+	appLog.Info("PDF photo query started", "id", id, "retry", retryCount)
 	photo, err := s.upstream.QueryPhoto(ctx, id)
 	if err != nil {
+		appLog.Error("PDF photo query failed", "id", id, "elapsed", time.Since(started), "error", err)
 		return err
 	}
-	started := time.Now()
-	s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: len(photo.Images), startedAt: started, updatedAt: time.Now()})
+	appLog.Info("PDF photo query completed", "id", id, "images", len(photo.Images), "elapsed", time.Since(started))
+	processingStarted := time.Now()
+	s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: len(photo.Images), startedAt: processingStarted, updatedAt: time.Now()})
+	appLog.Info("PDF image processing started", "id", id, "images", len(photo.Images), "network_concurrency", s.cfg.NetworkConcurrency, "cpu_concurrency", s.cfg.CPUConcurrency)
 	pdf, err := s.images.GeneratePDF(
 		ctx,
 		photo,
@@ -396,17 +424,25 @@ func (s *Service) generateTask(ctx context.Context, id string, retryCount int) e
 		s.cfg.NetworkConcurrency,
 		s.cfg.CPUConcurrency,
 		func(progress ProgressInfo) {
-			s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: len(photo.Images), startedAt: started, processedImages: progress.Processed, updatedAt: time.Now()})
+			s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: len(photo.Images), startedAt: processingStarted, processedImages: progress.Processed, updatedAt: time.Now()})
+			appLog.Info("PDF image progress", "id", id, "processed", progress.Processed, "total", progress.Total)
 		},
 		func(elapsed time.Duration, total int) {
 			eta := int(math.Round(float64(elapsed.Milliseconds()*int64(total)) / float64(s.cfg.CPUConcurrency) / 1000))
-			s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: total, startedAt: started, processedImages: 1, etaSeconds: eta, updatedAt: time.Now()})
+			s.states.set(id, taskState{status: "processing", retryCount: retryCount, totalImages: total, startedAt: processingStarted, processedImages: 1, etaSeconds: eta, updatedAt: time.Now()})
+			appLog.Info("first PDF image processed", "id", id, "total", total, "elapsed", elapsed, "eta_seconds", eta)
 		},
 	)
 	if err != nil {
+		appLog.Error("PDF image processing failed", "id", id, "elapsed", time.Since(processingStarted), "error", err)
 		return err
 	}
-	return s.pdfCache.Set(id, pdf)
+	appLog.Info("PDF image processing completed", "id", id, "bytes", len(pdf), "elapsed", time.Since(processingStarted))
+	if err := s.pdfCache.Set(id, pdf); err != nil {
+		appLog.Error("PDF cache write failed", "id", id, "error", err)
+		return err
+	}
+	return nil
 }
 
 func translateError(err error) error {

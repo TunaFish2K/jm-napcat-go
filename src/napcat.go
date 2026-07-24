@@ -69,10 +69,16 @@ type NapcatClient struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan actionResponse
 	nextEcho  atomic.Uint64
+
+	actionTimeout time.Duration
 }
 
 func NewNapcatClient(cfg Config) *NapcatClient {
-	return &NapcatClient{cfg: cfg, pending: make(map[string]chan actionResponse)}
+	return &NapcatClient{
+		cfg:           cfg,
+		pending:       make(map[string]chan actionResponse),
+		actionTimeout: 10 * time.Second,
+	}
 }
 
 func (c *NapcatClient) Run(ctx context.Context, onMessage func(MessageContext), onFriendRequest func(int64, string), onLogin func(LoginInfo)) error {
@@ -91,7 +97,7 @@ func (c *NapcatClient) Run(ctx context.Context, onMessage func(MessageContext), 
 		}
 		lastErr = err
 		if attempt < reconnectAttempts {
-			fmt.Printf("Napcat connection failed (%d/%d): %v; retrying in 5s\n", attempt+1, reconnectAttempts, err)
+			appLog.Warn("NapCat connection failed; retrying", "attempt", attempt+1, "max_attempts", reconnectAttempts+1, "retry_in", "5s", "error", err)
 			timer := time.NewTimer(5 * time.Second)
 			select {
 			case <-timer.C:
@@ -103,7 +109,7 @@ func (c *NapcatClient) Run(ctx context.Context, onMessage func(MessageContext), 
 			}
 		}
 	}
-	return fmt.Errorf("Napcat connection failed after retries: %w", lastErr)
+	return fmt.Errorf("NapCat connection failed after retries: %w", lastErr)
 }
 
 func (c *NapcatClient) dial(ctx context.Context) (*websocket.Conn, error) {
@@ -137,13 +143,14 @@ func (c *NapcatClient) runConnection(ctx context.Context, conn *websocket.Conn, 
 	go func() { readErrors <- c.readLoop(ctx, conn, onMessage, onFriendRequest) }()
 	login, err := c.LoginInfo(ctx)
 	if err != nil {
+		appLog.Error("NapCat login info request failed", "error", err)
 		_ = conn.Close()
 		return err
 	}
 	if onLogin != nil {
 		onLogin(login)
 	}
-	fmt.Printf("Connected to Napcat\n")
+	appLog.Info("NapCat connected", "user_id", login.UserID, "nickname", login.Nickname)
 
 	select {
 	case <-ctx.Done():
@@ -165,19 +172,42 @@ func (c *NapcatClient) readLoop(ctx context.Context, conn *websocket.Conn, onMes
 			PostType string          `json:"post_type"`
 		}
 		if err := json.Unmarshal(data, &envelope); err != nil {
+			appLog.Warn("invalid NapCat WebSocket payload", "error", err)
 			continue
 		}
 		if len(envelope.Echo) > 0 && string(envelope.Echo) != "null" {
 			var response actionResponse
-			if json.Unmarshal(data, &response) == nil {
+			if err := json.Unmarshal(data, &response); err != nil {
+				appLog.Warn("invalid NapCat action response", "echo", echoString(envelope.Echo), "error", err)
+			} else {
 				c.resolvePending(echoString(envelope.Echo), response)
 			}
 			continue
 		}
 		if envelope.PostType == "message" {
 			message, err := decodeMessageEvent(data)
-			if err == nil && onMessage != nil {
-				onMessage(message)
+			if err != nil {
+				appLog.Warn("failed to decode NapCat message event", "error", err)
+				continue
+			}
+			appLog.Info("message received",
+				"message_type", message.MessageType,
+				"user_id", message.UserID,
+				"group_id", message.GroupID,
+				"segments", len(message.Segments),
+				"text", shortText(extractText(message.Segments), 160),
+			)
+			if onMessage != nil {
+				// The handler may call a NapCat action and wait for its response.
+				// Keep it off the reader goroutine so that response can be consumed.
+				go func(message MessageContext) {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							appLog.Error("message handler panicked", "panic", recovered)
+						}
+					}()
+					onMessage(message)
+				}(message)
 			}
 			continue
 		}
@@ -187,8 +217,13 @@ func (c *NapcatClient) readLoop(ctx context.Context, conn *websocket.Conn, onMes
 				UserID      int64  `json:"user_id"`
 				Comment     string `json:"comment"`
 			}
-			if json.Unmarshal(data, &request) == nil && request.RequestType == "friend" && onFriendRequest != nil {
-				onFriendRequest(request.UserID, request.Comment)
+			if err := json.Unmarshal(data, &request); err != nil {
+				appLog.Warn("failed to decode NapCat request event", "error", err)
+			} else if request.RequestType == "friend" {
+				appLog.Info("friend request received", "user_id", request.UserID, "comment", shortText(request.Comment, 160))
+				if onFriendRequest != nil {
+					go onFriendRequest(request.UserID, request.Comment)
+				}
 			}
 		}
 		if ctx.Err() != nil {
@@ -277,31 +312,50 @@ func (c *NapcatClient) call(ctx context.Context, action string, params map[strin
 		return actionResponse{}, errors.New("Napcat instance not initialized")
 	}
 	echo := fmt.Sprintf("jm-%d", c.nextEcho.Add(1))
+	actionTimeout := c.actionTimeout
+	if actionTimeout <= 0 {
+		actionTimeout = 10 * time.Second
+	}
+	actionCtx, cancel := context.WithTimeout(ctx, actionTimeout)
+	defer cancel()
+	started := time.Now()
 	responseChannel := make(chan actionResponse, 1)
 	c.pendingMu.Lock()
 	c.pending[echo] = responseChannel
 	c.pendingMu.Unlock()
 	request := map[string]any{"action": action, "params": params, "echo": echo}
 	c.writeMu.Lock()
+	deadline, _ := actionCtx.Deadline()
+	_ = conn.SetWriteDeadline(deadline)
 	writeErr := conn.WriteJSON(request)
+	_ = conn.SetWriteDeadline(time.Time{})
 	c.writeMu.Unlock()
 	if writeErr != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, echo)
 		c.pendingMu.Unlock()
+		appLog.Warn("NapCat action write failed", "action", action, "echo", echo, "elapsed", time.Since(started), "error", writeErr)
 		return actionResponse{}, writeErr
 	}
+	appLog.Debug("NapCat action sent", "action", action, "echo", echo)
 	select {
 	case response := <-responseChannel:
 		if response.Retcode != 0 || response.Status == "failed" {
+			appLog.Warn("NapCat action failed", "action", action, "echo", echo, "retcode", response.Retcode, "status", response.Status, "elapsed", time.Since(started), "message", shortText(response.Message, 240))
 			return response, fmt.Errorf("Napcat action %s failed (%d): %s", action, response.Retcode, response.Message)
 		}
+		appLog.Debug("NapCat action completed", "action", action, "echo", echo, "elapsed", time.Since(started))
 		return response, nil
-	case <-ctx.Done():
+	case <-actionCtx.Done():
 		c.pendingMu.Lock()
 		delete(c.pending, echo)
 		c.pendingMu.Unlock()
-		return actionResponse{}, ctx.Err()
+		if errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
+			appLog.Warn("NapCat action timed out", "action", action, "echo", echo, "timeout", actionTimeout, "elapsed", time.Since(started))
+		} else {
+			appLog.Debug("NapCat action canceled", "action", action, "echo", echo, "elapsed", time.Since(started), "error", actionCtx.Err())
+		}
+		return actionResponse{}, actionCtx.Err()
 	}
 }
 

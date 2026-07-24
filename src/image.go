@@ -133,7 +133,7 @@ func (p *ImageProcessor) Process(raw []byte, scrambleID, photoID int, filename s
 func (p *ImageProcessor) ProcessSafe(raw []byte, scrambleID, photoID int, filename string) []byte {
 	processed, err := p.Process(raw, scrambleID, photoID, filename)
 	if err != nil {
-		fmt.Printf("Failed to process image %s: %v\n", filename, err)
+		appLog.Warn("image processing failed", "image", filename, "error", err)
 		return nil
 	}
 	return processed

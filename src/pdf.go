@@ -38,22 +38,25 @@ func (p *ImageProcessor) GeneratePDF(
 	if len(photo.Images) == 0 {
 		return nil, fmt.Errorf("No images could be embedded into PDF")
 	}
+	started := time.Now()
+	appLog.Info("PDF generation started", "photo_id", photo.ID, "images", len(photo.Images), "network_concurrency", networkConcurrency, "cpu_concurrency", cpuConcurrency, "retries", imageRetries)
 	network := make(chan struct{}, max(1, networkConcurrency))
 	cpu := make(chan struct{}, max(1, cpuConcurrency))
 	results := make([]*processedImage, len(photo.Images))
+	completed := make(chan int, len(photo.Images))
 	var wg sync.WaitGroup
 	var firstMu sync.Mutex
 	firstReported := false
-	started := time.Now()
 
 	for index, item := range photo.Images {
 		index, item := index, item
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { completed <- index }()
 			raw, err := p.downloadWithRetry(ctx, item.URL, imageRetries, network)
 			if err != nil {
-				fmt.Printf("Failed to download %s (photo %s): %v\n", item.Name, photo.ID, err)
+				appLog.Warn("PDF image download failed", "photo_id", photo.ID, "image", item.Name, "index", index+1, "error", err)
 				return
 			}
 			select {
@@ -64,14 +67,16 @@ func (p *ImageProcessor) GeneratePDF(
 			processed, processErr := p.Process(raw, photo.ScrambleID, parsePhotoID(photo.ID), item.Name)
 			<-cpu
 			if processErr != nil {
-				fmt.Printf("Failed to process %s (photo %s): %v\n", item.Name, photo.ID, processErr)
+				appLog.Warn("PDF image processing failed", "photo_id", photo.ID, "image", item.Name, "index", index+1, "error", processErr)
 				return
 			}
 			config, _, configErr := image.DecodeConfig(bytes.NewReader(processed))
 			if configErr != nil {
+				appLog.Warn("processed PDF image metadata failed", "photo_id", photo.ID, "image", item.Name, "index", index+1, "error", configErr)
 				return
 			}
 			results[index] = &processedImage{Data: processed, Width: config.Width, Height: config.Height, Name: item.Name}
+			appLog.Debug("PDF image processed", "photo_id", photo.ID, "image", item.Name, "index", index+1, "bytes", len(processed))
 			firstMu.Lock()
 			if !firstReported {
 				firstReported = true
@@ -82,22 +87,36 @@ func (p *ImageProcessor) GeneratePDF(
 			firstMu.Unlock()
 		}()
 	}
-	wg.Wait()
 
 	pages := make([]pdfPage, 0, len(results))
-	for _, item := range results {
-		if item == nil {
-			continue
-		}
-		pages = append(pages, pdfPage{Image: item.Data, Width: item.Width, Height: item.Height})
-		if onProgress != nil {
-			onProgress(ProgressInfo{Processed: len(pages), Total: len(photo.Images)})
+	ready := make([]bool, len(results))
+	nextToEmbed := 0
+	for completedCount := 0; completedCount < len(results); completedCount++ {
+		index := <-completed
+		ready[index] = true
+		for nextToEmbed < len(results) && ready[nextToEmbed] {
+			item := results[nextToEmbed]
+			if item != nil {
+				pages = append(pages, pdfPage{Image: item.Data, Width: item.Width, Height: item.Height})
+				if onProgress != nil {
+					onProgress(ProgressInfo{Processed: len(pages), Total: len(photo.Images)})
+				}
+			}
+			nextToEmbed++
 		}
 	}
+	wg.Wait()
 	if len(pages) == 0 {
+		appLog.Error("PDF generation produced no pages", "photo_id", photo.ID, "elapsed", time.Since(started))
 		return nil, fmt.Errorf("No images could be embedded into PDF")
 	}
-	return buildPDF(pages)
+	pdf, err := buildPDF(pages)
+	if err != nil {
+		appLog.Error("PDF assembly failed", "photo_id", photo.ID, "pages", len(pages), "elapsed", time.Since(started), "error", err)
+		return nil, err
+	}
+	appLog.Info("PDF generation completed", "photo_id", photo.ID, "pages", len(pages), "bytes", len(pdf), "elapsed", time.Since(started))
+	return pdf, nil
 }
 
 func (p *ImageProcessor) downloadWithRetry(ctx context.Context, rawURL string, retries int, pool chan struct{}) ([]byte, error) {
@@ -118,6 +137,7 @@ func (p *ImageProcessor) downloadWithRetry(ctx context.Context, rawURL string, r
 		}
 		lastErr = err
 		if attempt < retries {
+			appLog.Warn("PDF image download retry", "url", shortText(rawURL, 180), "attempt", attempt+1, "max_attempts", retries, "error", err)
 			timer := time.NewTimer(time.Duration(attempt) * time.Second)
 			select {
 			case <-timer.C:

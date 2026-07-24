@@ -19,6 +19,11 @@ The executable actively connects to the NapCat forward WebSocket configured
 by `napcatWsUrl`. It also contacts the configured JM upstream service to
 query metadata and download images.
 
+Runtime logs are written to stderr with timestamps. They include received
+messages, parsed commands, upstream/cache stages, PDF worker progress, and
+NapCat action failures or timeouts. Access tokens and message payloads such
+as Base64 images and PDFs are not logged.
+
 The command behavior is preserved from the TypeScript runtime:
 
 - `/query`, `/查询`, `/本子` query information.
