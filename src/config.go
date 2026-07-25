@@ -30,6 +30,7 @@ type Config struct {
 	CPUConcurrency         int    `json:"cpuConcurrency"`
 	NapcatWSURL            string `json:"napcatWsUrl"`
 	NapcatAccessToken      string `json:"napcatAccessToken"`
+	ActionTimeoutMs        int64  `json:"actionTimeoutMs"`
 	PollIntervalMS         int64  `json:"pollIntervalMs"`
 	MaxPollAttempts        int    `json:"maxPollAttempts"`
 	RateLimitWindowMS      int64  `json:"rateLimitWindowMs"`
@@ -52,6 +53,7 @@ var configFields = []string{
 	"cpuConcurrency",
 	"napcatWsUrl",
 	"napcatAccessToken",
+	"actionTimeoutMs",
 	"pollIntervalMs",
 	"maxPollAttempts",
 	"rateLimitWindowMs",
@@ -79,6 +81,7 @@ func DefaultConfig() Config {
 		CPUConcurrency:         cpu,
 		NapcatWSURL:            "ws://localhost:3001",
 		NapcatAccessToken:      "",
+		ActionTimeoutMs:        10_000,
 		PollIntervalMS:         2_000,
 		MaxPollAttempts:        150,
 		RateLimitWindowMS:      10_000,
@@ -162,6 +165,7 @@ func (c Config) Validate() error {
 		{"imageDownloadRetries", int64(c.ImageDownloadRetries)},
 		{"networkConcurrency", int64(c.NetworkConcurrency)},
 		{"cpuConcurrency", int64(c.CPUConcurrency)},
+		{"actionTimeoutMs", c.ActionTimeoutMs},
 		{"pollIntervalMs", c.PollIntervalMS},
 		{"maxPollAttempts", int64(c.MaxPollAttempts)},
 		{"rateLimitWindowMs", c.RateLimitWindowMS},

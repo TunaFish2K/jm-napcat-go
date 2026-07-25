@@ -74,10 +74,14 @@ type NapcatClient struct {
 }
 
 func NewNapcatClient(cfg Config) *NapcatClient {
+	timeout := time.Duration(cfg.ActionTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	return &NapcatClient{
 		cfg:           cfg,
 		pending:       make(map[string]chan actionResponse),
-		actionTimeout: 10 * time.Second,
+		actionTimeout: timeout,
 	}
 }
 
