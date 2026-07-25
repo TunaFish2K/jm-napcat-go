@@ -59,6 +59,12 @@ type actionResponse struct {
 	Echo    json.RawMessage `json:"echo"`
 }
 
+const (
+	pingPeriod = 30 * time.Second
+	pongWait   = 60 * time.Second
+	writeWait  = 10 * time.Second
+)
+
 type NapcatClient struct {
 	cfg Config
 
@@ -70,7 +76,8 @@ type NapcatClient struct {
 	pending   map[string]chan actionResponse
 	nextEcho  atomic.Uint64
 
-	actionTimeout time.Duration
+	actionTimeout     time.Duration
+	fileActionTimeout time.Duration
 }
 
 func NewNapcatClient(cfg Config) *NapcatClient {
@@ -78,10 +85,15 @@ func NewNapcatClient(cfg Config) *NapcatClient {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	fileTimeout := time.Duration(cfg.FileActionTimeoutMs) * time.Millisecond
+	if fileTimeout <= 0 {
+		fileTimeout = 60 * time.Second
+	}
 	return &NapcatClient{
-		cfg:           cfg,
-		pending:       make(map[string]chan actionResponse),
-		actionTimeout: timeout,
+		cfg:               cfg,
+		pending:           make(map[string]chan actionResponse),
+		actionTimeout:     timeout,
+		fileActionTimeout: fileTimeout,
 	}
 }
 
@@ -141,6 +153,34 @@ func (c *NapcatClient) runConnection(ctx context.Context, conn *websocket.Conn, 
 		c.connMu.Unlock()
 		c.failPending(errors.New("Napcat connection closed"))
 		_ = conn.Close()
+	}()
+
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	pingCtx, stopPing := context.WithCancel(ctx)
+	defer stopPing()
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.connMu.RLock()
+				current := c.conn
+				c.connMu.RUnlock()
+				if current != conn {
+					return
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+				_ = conn.WriteMessage(websocket.PingMessage, nil)
+			case <-pingCtx.Done():
+				return
+			}
+		}
 	}()
 
 	readErrors := make(chan error, 1)
@@ -280,7 +320,11 @@ func (c *NapcatClient) Send(ctx context.Context, target MessageContext, message 
 	} else {
 		params["group_id"] = target.GroupID
 	}
-	_, err := c.call(ctx, "send_msg", params)
+	timeout := c.actionTimeout
+	if containsFileSegment(message) {
+		timeout = c.fileActionTimeout
+	}
+	_, err := c.callWithTimeout(ctx, "send_msg", params, timeout)
 	return err
 }
 
@@ -300,15 +344,19 @@ func (c *NapcatClient) SendForward(ctx context.Context, target MessageContext, n
 	params := map[string]any{"message": serialized}
 	if target.MessageType == "private" {
 		params["user_id"] = target.UserID
-		_, err := c.call(ctx, "send_private_forward_msg", params)
+		_, err := c.callWithTimeout(ctx, "send_private_forward_msg", params, c.fileActionTimeout)
 		return err
 	}
 	params["group_id"] = target.GroupID
-	_, err := c.call(ctx, "send_forward_msg", params)
+	_, err := c.callWithTimeout(ctx, "send_forward_msg", params, c.fileActionTimeout)
 	return err
 }
 
 func (c *NapcatClient) call(ctx context.Context, action string, params map[string]any) (actionResponse, error) {
+	return c.callWithTimeout(ctx, action, params, c.actionTimeout)
+}
+
+func (c *NapcatClient) callWithTimeout(ctx context.Context, action string, params map[string]any, timeout time.Duration) (actionResponse, error) {
 	c.connMu.RLock()
 	conn := c.conn
 	c.connMu.RUnlock()
@@ -316,11 +364,10 @@ func (c *NapcatClient) call(ctx context.Context, action string, params map[strin
 		return actionResponse{}, errors.New("Napcat instance not initialized")
 	}
 	echo := fmt.Sprintf("jm-%d", c.nextEcho.Add(1))
-	actionTimeout := c.actionTimeout
-	if actionTimeout <= 0 {
-		actionTimeout = 10 * time.Second
+	if timeout <= 0 {
+		timeout = 10 * time.Second
 	}
-	actionCtx, cancel := context.WithTimeout(ctx, actionTimeout)
+	actionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	started := time.Now()
 	responseChannel := make(chan actionResponse, 1)
@@ -355,7 +402,7 @@ func (c *NapcatClient) call(ctx context.Context, action string, params map[strin
 		delete(c.pending, echo)
 		c.pendingMu.Unlock()
 		if errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
-			appLog.Warn("NapCat action timed out", "action", action, "echo", echo, "timeout", actionTimeout, "elapsed", time.Since(started))
+			appLog.Warn("NapCat action timed out", "action", action, "echo", echo, "timeout", timeout, "elapsed", time.Since(started))
 		} else {
 			appLog.Debug("NapCat action canceled", "action", action, "echo", echo, "elapsed", time.Since(started), "error", actionCtx.Err())
 		}
@@ -388,6 +435,15 @@ func echoString(raw json.RawMessage) string {
 		return value
 	}
 	return string(raw)
+}
+
+func containsFileSegment(segments []MessageSegment) bool {
+	for _, s := range segments {
+		if s.Type == "file" {
+			return true
+		}
+	}
+	return false
 }
 
 func TextSegment(text string) MessageSegment {
